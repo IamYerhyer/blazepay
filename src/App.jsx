@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
+import { useWizardConnect, WizardConnectQRDialog } from '@wizardconnect/react';
+import { childIndexOfPathName } from '@wizardconnect/core';
 import {
   CURRENCIES, validateCashAddr, withPrefix, fiatToBch, formatBchAmount, bchToSats,
   buildBip21Uri, encodeInvoice, decodeInvoice, makeInvoice,
   evaluatePayment, parseAddressDashboard,
   providerLabel, shouldUseHaskoinFallback,
   parseHaskoinBalance, findHaskoinPaymentTx, evaluateHaskoinPayment,
+  pubkeyToCashAddr, pickWalletAddress, WALLET_PATH_PREFERENCE,
 } from './lib/blaze.js';
 import bchLogo from './assets/bch-logo.svg';
 
@@ -76,6 +79,186 @@ function TopBar() {
   );
 }
 
+// ------------------------------------------------------------------ wallet connect (WizardConnect)
+// All WizardConnect configuration lives here. The SDK (hdwalletv1 over Nostr
+// relays) has no WalletConnect-style projectId and no metadata object: the
+// only dapp identity it sends in `dapp_ready` is the name + icon below.
+// dappUrl is kept here as the canonical site URL for reference.
+const WIZARDCONNECT_CONFIG = {
+  dappName: 'BlazePay',
+  dappUrl: 'https://iamyerhyer.github.io/blazepay/',
+  dappIcon: 'https://iamyerhyer.github.io/blazepay/favicon.svg',
+};
+
+/**
+ * Read the connected wallet's addresses from a DappConnectionManager.
+ * The wallet shares xpubs for named paths (getSessionPaths); the manager
+ * derives pubkeys on demand (getPubkey). Paths the wallet did not announce
+ * are still attempted for the well-known names — getPubkey simply returns
+ * undefined when no xpub is stored for that child index.
+ * Returns [{ path, index, address }] with full bitcoincash: addresses.
+ */
+function collectWalletCandidates(manager) {
+  const candidates = [];
+  if (!manager) return candidates;
+  let names = [];
+  try {
+    names = (manager.getSessionPaths() || []).map((p) => p?.name).filter(Boolean);
+  } catch { names = []; }
+  for (const name of WALLET_PATH_PREFERENCE) {
+    if (!names.includes(name)) names.push(name);
+  }
+  for (const name of names) {
+    const child = childIndexOfPathName(name);
+    if (child == null) continue;
+    let pub = null;
+    try { pub = manager.getPubkey(child, 0n); } catch { pub = null; }
+    if (!pub) continue;
+    const address = pubkeyToCashAddr(pub);
+    if (address) candidates.push({ path: name, index: 0, address });
+  }
+  return candidates;
+}
+
+const shortAddr = (a) => (a && a.length > 34 ? `${a.slice(0, 24)}…${a.slice(-8)}` : a);
+
+// If anything inside the connect panel ever throws, the create form below it
+// must stay fully usable — wallet connect is a convenience, never a gate.
+class ConnectPanelBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch() { /* panel-only failure; manual paste below still works */ }
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="connect-panel">
+          <p><strong>Wallet connect isn't available in this browser.</strong> No problem — just paste your CashAddr below.</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function WalletConnectPanel({ address, onWalletAddress, onApplyWalletAddress, onWalletDisconnect }) {
+  const { state, manager, uri, qrUri, walletName, walletIcon, connect, disconnect, error } =
+    useWizardConnect({ dappName: WIZARDCONNECT_CONFIG.dappName, dappIcon: WIZARDCONNECT_CONFIG.dappIcon });
+
+  // Derive the wallet's payee address straight from the session state —
+  // recomputed only when the session (manager) changes. A connected wallet
+  // whose xpubs yield no usable address is an honest failure, not a fake fill.
+  const derived = useMemo(() => {
+    if (state !== 'connected' || !manager) return { address: null, failed: false };
+    const picked = pickWalletAddress(collectWalletCandidates(manager));
+    return picked ? { address: picked, failed: false } : { address: null, failed: true };
+  }, [state, manager]);
+  const walletAddress = derived.address;
+  const readError = derived.failed
+    ? 'Connected, but no BCH address could be read from this wallet — please paste your CashAddr below.'
+    : '';
+
+  // Hand the address up to the form exactly once per session (per manager).
+  const filledForRef = useRef(null);
+  useEffect(() => {
+    if (state === 'idle' || state === 'disconnected') { filledForRef.current = null; return; }
+    if (!walletAddress || !manager) return;
+    if (filledForRef.current === manager) return;
+    filledForRef.current = manager;
+    onWalletAddress(walletAddress);
+  }, [state, manager, walletAddress, onWalletAddress]);
+
+  // Soft timeout: after 90s of waiting, hint that the wallet app needs a
+  // look — the session itself is left alone (the dialog stays closable).
+  // The start time is stamped by the Connect button's click handler; a
+  // 5-second interval tick keeps the hint current while waiting.
+  const [connectStartedAt, setConnectStartedAt] = useState(null);
+  const [nowTs, setNowTs] = useState(() => Date.now());
+  useEffect(() => {
+    if (state !== 'connecting') return undefined;
+    const t = setInterval(() => setNowTs(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, [state]);
+  const slowWait = state === 'connecting' && connectStartedAt != null
+    && nowTs - connectStartedAt >= 90000;
+
+  async function handleDisconnect() {
+    onWalletDisconnect();
+    await disconnect();
+  }
+
+  if (state === 'connected') {
+    return (
+      <div className="connect-panel">
+        {typeof walletIcon === 'string' && /^(data:|https?:)/.test(walletIcon)
+          ? <img className="connect-wallet-icon" src={walletIcon} alt="" />
+          : <span className="dot dot-green" />}
+        <div className="connect-main">
+          <p>
+            <strong>Connected{walletName ? ` to ${walletName}` : ' to your wallet'}</strong>
+            {walletAddress && <> · <span className="connect-addr" title={walletAddress}>{shortAddr(walletAddress)}</span></>}
+          </p>
+          {readError && <p className="field-err">{readError}</p>}
+          {!walletAddress && !readError && <p>Reading your receive address…</p>}
+          {walletAddress && address !== walletAddress && (
+            <p>Your wallet's address is ready — <button type="button" className="linklike" onClick={() => onApplyWalletAddress(walletAddress)}>use this address</button> in the form below.</p>
+          )}
+          {walletAddress && address === walletAddress && <p>Your CashAddr below was filled from your wallet. You can still edit it.</p>}
+        </div>
+        <button type="button" className="btn btn-white" onClick={handleDisconnect}>Disconnect</button>
+      </div>
+    );
+  }
+
+  if (state === 'connecting' || state === 'reconnecting') {
+    return (
+      <div className="connect-panel">
+        <span className="dot dot-amber pulse" />
+        <div className="connect-main">
+          <p>
+            <strong>{state === 'reconnecting' ? 'Reconnecting to your wallet…' : 'Waiting for your wallet…'}</strong>{' '}
+            {state === 'connecting' ? 'Scan the QR code with Paytaca or Cashonize and approve the connection.' : 'Restoring your earlier session.'}
+          </p>
+          {slowWait && <p>Still waiting — open your wallet app and approve the connection, or close the QR dialog and paste your CashAddr below instead.</p>}
+        </div>
+        <button type="button" className="btn btn-white" onClick={handleDisconnect}>Cancel</button>
+        {uri && qrUri && (
+          <WizardConnectQRDialog
+            show={state === 'connecting'}
+            onClose={handleDisconnect}
+            uri={uri}
+            qrUri={qrUri}
+            title="Connect with WizardConnect"
+            subtitle="Scan with Paytaca or Cashonize to connect"
+            theme={{
+              dialogBackground: '#ffffff', headerBackground: '#ffffff',
+              titleColor: '#131311', subtitleColor: '#6f6e66',
+              qrForeground: '#0a3d22', qrBackground: '#ffffff',
+              uriRowBackground: '#f6f5f0', uriTextColor: '#6f6e66',
+              borderColor: '#e7e4da', closeButtonColor: '#6f6e66', copyButtonColor: '#07853e',
+            }}
+          />
+        )}
+      </div>
+    );
+  }
+
+  // idle / disconnected
+  return (
+    <div className="connect-panel">
+      <button type="button" className="btn btn-white" onClick={() => { setConnectStartedAt(Date.now()); connect(); }}>
+        <span className="dot dot-green" /> Connect wallet
+      </button>
+      <div className="connect-main">
+        <p><strong>Connect a BCH wallet</strong> (Paytaca, Cashonize) with WizardConnect and BlazePay fills in your address automatically. Prefer not to? Just paste your CashAddr below — no account, no sign-up.</p>
+        {error && <p className="field-err">Wallet connection didn't complete ({error}) — paste your CashAddr below instead.</p>}
+      </div>
+    </div>
+  );
+}
+
 // ------------------------------------------------------------------ create
 function CreateForm({ prices, onCreated }) {
   const [name, setName] = useState('');
@@ -85,6 +268,31 @@ function CreateForm({ prices, onCreated }) {
   const [address, setAddress] = useState('');
   const [manualBch, setManualBch] = useState('');
   const [error, setError] = useState('');
+  // The exact string the wallet last filled into the address field. Used to
+  // (a) avoid overwriting an address the user typed by hand, and (b) clear
+  // the field on disconnect only while it still holds the wallet's value.
+  const [walletFilled, setWalletFilled] = useState(null);
+
+  const handleWalletAddress = useCallback((picked) => {
+    // Fill only an empty field (or one still holding the previous wallet
+    // value). If the user typed a different address by hand, leave it — the
+    // panel offers a "use this address" button for the wallet's address.
+    if (!address || address === walletFilled) {
+      setWalletFilled(picked);
+      setAddress(picked);
+    }
+  }, [address, walletFilled]);
+
+  const handleApplyWalletAddress = useCallback((picked) => {
+    setWalletFilled(picked);
+    setAddress(picked);
+  }, []);
+
+  const handleWalletDisconnect = useCallback(() => {
+    // Clear the field only while it still holds the wallet-filled value.
+    if (walletFilled && address === walletFilled) setAddress('');
+    setWalletFilled(null);
+  }, [address, walletFilled]);
 
   const addrCheck = useMemo(() => (address ? validateCashAddr(address) : null), [address]);
   const liveBch = useMemo(
@@ -116,12 +324,14 @@ function CreateForm({ prices, onCreated }) {
       <h2 className="section-title">Create a payment link</h2>
       <p className="section-sub">Price it in USD, EUR, GBP, NGN, GHS, KES and more — your payer settles in BCH.</p>
 
-      <div className="connect-panel">
-        <button type="button" className="btn btn-white" disabled title="WizardConnect arrives in the next build step">
-          Connect wallet
-        </button>
-        <p><strong>Wallet connect is coming in the next step</strong> (WizardConnect). For now, just paste your CashAddr below — no account, no sign-up.</p>
-      </div>
+      <ConnectPanelBoundary>
+        <WalletConnectPanel
+          address={address}
+          onWalletAddress={handleWalletAddress}
+          onApplyWalletAddress={handleApplyWalletAddress}
+          onWalletDisconnect={handleWalletDisconnect}
+        />
+      </ConnectPanelBoundary>
 
       <form className="form" onSubmit={submit}>
         <label>Your name or business
@@ -458,7 +668,7 @@ function Home({ prices, onCreated }) {
       <section className="section" id="how">
         <h2 className="section-title">How it works</h2>
         <div className="steps">
-          <div className="step"><span className="step-num">1</span><h3>Price it your way</h3><p>Type an amount in your own currency and paste your BCH address. BlazePay converts at the live rate and locks it into the link.</p></div>
+          <div className="step"><span className="step-num">1</span><h3>Price it your way</h3><p>Type an amount in your own currency, connect your BCH wallet or paste your address, and BlazePay converts at the live rate and locks it into the link.</p></div>
           <div className="step"><span className="step-num">2</span><h3>Share the link</h3><p>Send it on WhatsApp, X, email — anywhere. The payer scans the QR with any BCH wallet and pays in one tap.</p></div>
           <div className="step"><span className="step-num">3</span><h3>Watch it land</h3><p>BlazePay watches the blockchain live. The moment the payment arrives, the page flips to Paid — with a receipt anyone can verify.</p></div>
         </div>
@@ -503,7 +713,7 @@ export default function App() {
         <footer className="footer">
           <span className="wordmark small">BlazePay<sup>®</sup></span>
           <p>Non-custodial payment links for Bitcoin Cash, priced in any currency. BlazePay never holds your money — payments go wallet-to-wallet on BCH mainnet.</p>
-          <p className="footer-fine">Built for BCH BLAZE 2026 · Scaffold build — wallet connect (WizardConnect) and the mainnet end-to-end test are still to come.</p>
+          <p className="footer-fine">Built for BCH BLAZE 2026 · Wallet connect by WizardConnect · The mainnet end-to-end test is still to come.</p>
         </footer>
       </div>
     </div>

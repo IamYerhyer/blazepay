@@ -11,6 +11,7 @@ import {
   evaluatePayment, parseAddressDashboard,
   providerLabel, shouldUseHaskoinFallback,
   parseHaskoinBalance, parseHaskoinTransaction, findHaskoinPaymentTx, evaluateHaskoinPayment,
+  pubkeyToCashAddr, pickWalletAddress, WALLET_PATH_PREFERENCE,
 } from '../src/lib/blaze.js';
 
 const EXAMPLE_ADDRESS = 'qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a'; // placeholder only
@@ -199,6 +200,60 @@ test('Haskoin payment evaluation: waiting → seen (mempool) → paid (confirmed
   // tolerance: 99.6% via a matching tx still counts
   const almostMatch = parseHaskoinTransaction(hkTx({ txid: 'almost', pays: [Math.floor(50000000 * 0.996)] }), EXAMPLE_ADDRESS);
   assert.equal(evaluateHaskoinPayment(base, parseHaskoinBalance(hkBalance({ received: 500000 + 49800000 })), inv, almostMatch).state, 'paid');
+});
+
+// ------------------------------------------------------------- WizardConnect wallet
+// Pubkey vectors are the generator point G (private key 1) in compressed and
+// uncompressed form. Expected CashAddrs were produced with libauth's
+// hash160 + encodeCashAddress and the compressed one's checksum was verified
+// against an independent implementation of the CashAddr spec polymod.
+const G_COMPRESSED = Uint8Array.from(Buffer.from('0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798', 'hex'));
+const G_UNCOMPRESSED = Uint8Array.from(Buffer.from('0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8', 'hex'));
+
+test('pubkeyToCashAddr derives the payee P2PKH CashAddr from a wallet pubkey', () => {
+  assert.equal(pubkeyToCashAddr(G_COMPRESSED), 'bitcoincash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cy4spdc2h');
+  assert.equal(pubkeyToCashAddr(G_UNCOMPRESSED), 'bitcoincash:qzgmyjle755g2v5kptrg02asx5f8k8fg55zdx7hd4l');
+  // derived addresses pass the app's own light validation
+  assert.equal(validateCashAddr(pubkeyToCashAddr(G_COMPRESSED)).ok, true);
+  // unusable input -> null, never a fabricated address
+  assert.equal(pubkeyToCashAddr(null), null);
+  assert.equal(pubkeyToCashAddr(undefined), null);
+  assert.equal(pubkeyToCashAddr('0279be66'), null); // string, not bytes
+  assert.equal(pubkeyToCashAddr(new Uint8Array(32)), null); // wrong length
+  assert.equal(pubkeyToCashAddr(new Uint8Array(64)), null);
+  assert.equal(pubkeyToCashAddr([]), null);
+});
+
+test('pickWalletAddress prefers receive > change > defi, then lowest index', () => {
+  const recv = 'bitcoincash:qp63uahgrxged4z5jswyt5dn5v3lzsem6cy4spdc2h';
+  const other = 'bitcoincash:' + EXAMPLE_ADDRESS;
+  assert.deepEqual(WALLET_PATH_PREFERENCE, ['receive', 'change', 'defi']);
+  // receive wins even when listed last and at a higher index
+  assert.equal(pickWalletAddress([
+    { path: 'defi', index: 0, address: other },
+    { path: 'change', index: 0, address: other },
+    { path: 'receive', index: 3, address: recv },
+  ]), recv);
+  // within a path, lowest index wins
+  assert.equal(pickWalletAddress([
+    { path: 'receive', index: 2, address: other },
+    { path: 'receive', index: 0, address: recv },
+  ]), recv);
+  // unknown paths rank after the well-known ones; case-insensitive path names
+  assert.equal(pickWalletAddress([
+    { path: 'stealth_scan', index: 0, address: other },
+    { path: 'Change', index: 0, address: recv },
+  ]), recv);
+  // invalid addresses are skipped, even on the preferred path
+  assert.equal(pickWalletAddress([
+    { path: 'receive', index: 0, address: 'not-an-address' },
+    { path: 'change', index: 0, address: other },
+  ]), other);
+  // nothing usable -> null
+  assert.equal(pickWalletAddress([]), null);
+  assert.equal(pickWalletAddress(null), null);
+  assert.equal(pickWalletAddress([{ path: 'receive', index: 0, address: '' }]), null);
+  assert.equal(pickWalletAddress([{ path: 'receive', index: 0 }]), null);
 });
 
 test('watcher fallback decision: any Blockchair failure routes to Haskoin', () => {

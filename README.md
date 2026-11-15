@@ -106,10 +106,13 @@ unavailable — retrying" and backs off to 30s; it never invents a state.
 
 ## Honest TODO list
 
-- [ ] **WizardConnect integration** — the "Connect wallet" button is currently
-      an honestly-labelled placeholder ("coming in the next step"); manual
-      CashAddr paste is the working path. Integrate `@wizardconnect/react` /
-      `dapp` / `core` so a Paytaca/Cashonize wallet pre-fills the payee address.
+- [x] **WizardConnect integration** — the "Connect wallet" button is live:
+      `@wizardconnect/react`'s `useWizardConnect` + `WizardConnectQRDialog`
+      pair with a Paytaca/Cashonize wallet (QR over the default Nostr relays —
+      no projectId needed), and the payee CashAddr is derived from the
+      wallet's shared xpubs (receive path first) and pre-filled. Manual
+      CashAddr paste remains fully supported and is never blocked by the
+      connect flow. Live phone test still to be done by Yahya.
 - [ ] **EMBER2026 banner address** — the top banner shows a clearly-marked TODO
       placeholder. Needs Yahya's real CashTokens (token-aware, `bitcoincash:z…`)
       address from his own wallet.

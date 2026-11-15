@@ -1,4 +1,7 @@
 // BlazePay pure logic — no DOM, no network. Unit-tested in tests/blaze.test.mjs.
+// (libauth below is a pure crypto/address codec — the same library the
+// WizardConnect SDK itself is built on; still no DOM, no network.)
+import { hash160, encodeCashAddress } from '@bitauth/libauth';
 
 // ---------------------------------------------------------------- CashAddr
 // LIGHT validation only: prefix, length and charset. This is NOT a full
@@ -35,6 +38,59 @@ export function validateCashAddr(input) {
     }
   }
   return { ok: true, bare, reason: '' };
+}
+
+// ---------------------------------------------------------------- wallet (WizardConnect)
+// WizardConnect's hdwalletv1 protocol does NOT hand the dapp ready-made
+// addresses: the wallet shares HD xpubs for named paths ("receive", "change",
+// "defi", …) and the dapp derives pubkeys itself
+// (DappConnectionManager.getPubkey(childIndex, index)). Turning a derived
+// pubkey into the payee CashAddr is therefore BlazePay's job:
+//
+//   pubkey (33-byte compressed / 65-byte uncompressed)
+//     -> hash160 (sha256 + ripemd160, via libauth)
+//     -> CashAddr encode, type p2pkh, prefix bitcoincash
+//
+// encodeCashAddress returns { address } in libauth v3 (a bare string in some
+// builds) — both shapes are handled. Any failure returns null, never a
+// made-up address.
+
+export function pubkeyToCashAddr(pubkey) {
+  if (!(pubkey instanceof Uint8Array)) return null;
+  if (pubkey.length !== 33 && pubkey.length !== 65) return null;
+  try {
+    const encoded = encodeCashAddress({ prefix: 'bitcoincash', type: 'p2pkh', payload: hash160(pubkey) });
+    const address = typeof encoded === 'string' ? encoded : encoded?.address;
+    if (typeof address !== 'string') return null;
+    return validateCashAddr(address).ok ? address : null;
+  } catch {
+    return null;
+  }
+}
+
+/** WizardConnect path names in the order BlazePay prefers a payee address from. */
+export const WALLET_PATH_PREFERENCE = ['receive', 'change', 'defi'];
+
+/**
+ * Pick the best payee address from wallet-derived candidates.
+ * candidates = [{ path, index, address }] (address may be bare or prefixed).
+ * Preference: "receive" path first, then "change", then "defi", then any
+ * other path; within a path, the lowest address index. Candidates whose
+ * address fails light CashAddr validation are skipped. Returns the chosen
+ * address string exactly as supplied, or null when nothing is usable.
+ */
+export function pickWalletAddress(candidates) {
+  if (!Array.isArray(candidates)) return null;
+  const rank = (path) => {
+    const i = WALLET_PATH_PREFERENCE.indexOf(typeof path === 'string' ? path.toLowerCase() : '');
+    return i === -1 ? WALLET_PATH_PREFERENCE.length : i;
+  };
+  const usable = candidates.filter(
+    (c) => c && typeof c.address === 'string' && validateCashAddr(c.address).ok,
+  );
+  if (!usable.length) return null;
+  usable.sort((a, b) => (rank(a.path) - rank(b.path)) || ((Number(a.index) || 0) - (Number(b.index) || 0)));
+  return usable[0].address;
 }
 
 // ---------------------------------------------------------------- amounts
