@@ -7,6 +7,7 @@ import {
   providerLabel, shouldUseHaskoinFallback,
   parseHaskoinBalance, findHaskoinPaymentTx, evaluateHaskoinPayment,
 } from './lib/blaze.js';
+import bchLogo from './assets/bch-logo.svg';
 
 // ------------------------------------------------------------------ prices
 function usePrices() {
@@ -451,7 +452,7 @@ function Home({ prices, onCreated }) {
             <a className="btn btn-white btn-big" href="#how"><span className="dot dot-green" /> See how it works</a>
           </div>
         </div>
-        <div className="blob-wrap" aria-hidden="true"><div className="blob" /></div>
+        <div className="blob-wrap"><img className="bch-logo" src={bchLogo} alt="Bitcoin Cash logo" /></div>
       </section>
 
       <section className="section" id="how">
