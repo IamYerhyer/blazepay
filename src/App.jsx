@@ -51,7 +51,7 @@ function HackathonBanner() {
     <div className="hack-banner">
       <span className="hack-banner-label">🏆 Built for BCH BLAZE 2026</span>
       {/* TODO placeholders — deliberately non-functional until the real links exist */}
-      <a href="#" onClick={(e) => e.preventDefault()} title="TODO: link the Widget Factory presentation">Presentation (TODO)</a>
+      <a href="https://docs.google.com/presentation/d/1fNYAyyYoifkBV2jJ6_1JvWQY4TWif3wvZfLQzZYYBKM/edit" target="_blank" rel="noreferrer">Presentation</a>
       <span className="hack-dot">·</span>
       <a href="https://github.com/IamYerhyer/blazepay" target="_blank" rel="noreferrer" title="BlazePay source code on GitHub">GitHub repo</a>
       <span className="hack-dot">·</span>
